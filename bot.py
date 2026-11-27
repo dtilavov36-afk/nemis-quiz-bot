@@ -363,7 +363,6 @@ async def health_handler(request: web.Request) -> web.Response:
 async def start_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/", health_handler)
-    app.router.add_head("/", health_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -372,7 +371,6 @@ async def start_web_server() -> web.AppRunner:
     await site.start()
     logging.info("🌐 Web server %d-portda ishga tushdi.", port)
     return runner
-
 
 async def main() -> None:
     runner = await start_web_server()
