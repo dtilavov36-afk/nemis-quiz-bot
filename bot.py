@@ -20,6 +20,7 @@ ADMIN_ID = 6792311422  # <-- O'zingizning raqamli Telegram ID'ingizni kiriting
 QUESTIONS_FILE = Path("questions.json")
 USERS_FILE = Path("users.json")
 GROUP_SIZE = 50
+TOP_RATING_LIMIT = 10
 
 RAW_TOKEN = os.getenv("BOT_TOKEN", "9260798734:AAH6ZRChgfmp7gphSKV1i-gp9WwDE3aJXsM").strip().strip('"').strip("'")
 if not RAW_TOKEN or ":" not in RAW_TOKEN:
@@ -37,7 +38,7 @@ active_quizzes: dict[int, dict] = {}
 poll_to_user: dict[str, int] = {}
 
 
-# ================= BAZA VA FOYDALANUVCHILAR =================
+# ================= BAZA VA STATISTIKA =================
 def load_questions() -> list[dict]:
     if not QUESTIONS_FILE.exists():
         raise FileNotFoundError(f"{QUESTIONS_FILE} fayli topilmadi!")
@@ -114,20 +115,164 @@ def save_users(users: dict) -> None:
     )
 
 
+def ensure_user_record(users: dict, user: types.User) -> tuple[dict, bool]:
+    uid = str(user.id)
+    is_new = uid not in users
+    if uid not in users:
+        users[uid] = {
+            "id": user.id,
+            "full_name": user.full_name,
+            "username": user.username or "",
+            "groups": {},
+        }
+    else:
+        users[uid]["full_name"] = user.full_name
+        users[uid]["username"] = user.username or ""
+        if "groups" not in users[uid] or not isinstance(users[uid]["groups"], dict):
+            users[uid]["groups"] = {}
+    return users[uid], is_new
+
+
+def record_group_result(
+    user_id: int,
+    group_label: str,
+    correct_q: int,
+    answered_q: int,
+) -> None:
+    if answered_q <= 0:
+        return
+
+    users = load_users()
+    uid = str(user_id)
+    if uid not in users:
+        users[uid] = {
+            "id": user_id,
+            "full_name": f"User {user_id}",
+            "username": "",
+            "groups": {},
+        }
+
+    groups = users[uid].setdefault("groups", {})
+    g_stats = groups.setdefault(
+        group_label,
+        {
+            "attempts": 0,
+            "answered": 0,
+            "correct": 0,
+        },
+    )
+    g_stats["attempts"] += 1
+    g_stats["answered"] += answered_q
+    g_stats["correct"] += correct_q
+    save_users(users)
+
+
+def get_user_totals(user_data: dict) -> tuple[int, int, int, float]:
+    groups = user_data.get("groups", {})
+    if not isinstance(groups, dict):
+        return 0, 0, 0, 0.0
+
+    total_attempts = 0
+    total_answered = 0
+    total_correct = 0
+
+    for g_stats in groups.values():
+        if isinstance(g_stats, dict):
+            total_attempts += int(g_stats.get("attempts", 0))
+            total_answered += int(g_stats.get("answered", 0))
+            total_correct += int(g_stats.get("correct", 0))
+
+    accuracy = round((total_correct / total_answered) * 100, 1) if total_answered else 0.0
+    return total_correct, total_answered, total_attempts, accuracy
+
+
+def build_rating_text(users: dict, current_user_id: int | None = None) -> str:
+    ranked: list[dict] = []
+
+    for uid_str, u_data in users.items():
+        if not isinstance(u_data, dict):
+            continue
+        correct_q, answered_q, attempts_q, accuracy = get_user_totals(u_data)
+        if answered_q <= 0:
+            continue
+        uid_int = int(u_data.get("id", uid_str)) if str(u_data.get("id", uid_str)).isdigit() else 0
+        ranked.append(
+            {
+                "id": uid_int,
+                "full_name": u_data.get("full_name") or f"Foydalanuvchi {uid_int}",
+                "username": u_data.get("username") or "",
+                "correct": correct_q,
+                "answered": answered_q,
+                "attempts": attempts_q,
+                "accuracy": accuracy,
+            }
+        )
+
+    if not ranked:
+        return (
+            "🏆 <b>Foydalanuvchilar reytingi</b>\n\n"
+            "Hali birorta ham test yakunlanmagan. Birinchi bo‘lib reytingga kiring!"
+        )
+
+    ranked.sort(
+        key=lambda item: (
+            item["correct"],
+            item["accuracy"],
+            item["answered"],
+        ),
+        reverse=True,
+    )
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = ["🏆 <b>Foydalanuvchilar reytingi (Top-10)</b>\n"]
+
+    for pos, item in enumerate(ranked[:TOP_RATING_LIMIT], start=1):
+        prefix = medals.get(pos, f"<b>{pos}.</b>")
+        safe_name = item["full_name"].replace("<", "<").replace(">", ">")
+        mark = " (Siz)" if current_user_id is not None and item["id"] == current_user_id else ""
+        lines.append(
+            f"{prefix} <b>{safe_name}</b>{mark} — "
+            f"<b>{item['correct']}</b>/{item['answered']} to'g'ri ({item['accuracy']}%)"
+        )
+
+    if current_user_id is not None:
+        user_pos = next(
+            (i for i, r in enumerate(ranked, start=1) if r["id"] == current_user_id),
+            None,
+        )
+        if user_pos is not None:
+            u_item = ranked[user_pos - 1]
+            lines.append(
+                f"\n📍 <b>Sizning o'rningiz:</b> #{user_pos} / {len(ranked)} "
+                f"({u_item['correct']}/{u_item['answered']} to'g'ri, {u_item['accuracy']}%)"
+            )
+
+    return "\n".join(lines)
+
+
+def format_groups_summary(groups: dict) -> str:
+    if not groups:
+        return "Hali birorta test ishlanmagan."
+
+    lines = []
+    for g_label, stats in groups.items():
+        attempts = stats.get("attempts", 0)
+        answered = stats.get("answered", 0)
+        correct = stats.get("correct", 0)
+        pct = round((correct / answered) * 100, 1) if answered else 0.0
+        lines.append(
+            f"• <b>{g_label}</b>: {attempts} marta test ({correct}/{answered} to'g'ri, {pct}%)"
+        )
+    return "\n".join(lines)
+
+
 async def track_and_notify(message: types.Message) -> None:
     user = message.from_user
     if not user:
         return
 
     users = load_users()
-    uid = str(user.id)
-    is_new = uid not in users
-
-    users[uid] = {
-        "id": user.id,
-        "full_name": user.full_name,
-        "username": user.username or "",
-    }
+    _, is_new = ensure_user_record(users, user)
     save_users(users)
 
     if is_new and ADMIN_ID and user.id != ADMIN_ID:
@@ -163,6 +308,12 @@ def build_groups_keyboard(total: int) -> ReplyKeyboardMarkup:
         rows.append(current_row)
 
     rows.append([KeyboardButton(text=f"📚 Barcha savollar (1–{total})")])
+    rows.append(
+        [
+            KeyboardButton(text="🏆 Reyting"),
+            KeyboardButton(text="📊 Mening natijalarim"),
+        ]
+    )
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
@@ -215,16 +366,23 @@ async def send_current_quiz(chat_id: int, user_id: int) -> None:
     if idx >= len(questions):
         total_q = len(questions)
         correct_q = session["correct"]
-        percent = round((correct_q / total_q) * 100, 1) if total_q else 0.0
         group_label = session["group_label"]
+        percent = round((correct_q / total_q) * 100, 1) if total_q else 0.0
+
+        record_group_result(user_id, group_label, correct_q, total_q)
         clear_user_polls(user_id)
         del active_quizzes[user_id]
+
+        users = load_users()
+        user_groups = users.get(str(user_id), {}).get("groups", {})
+        g_attempts = user_groups.get(group_label, {}).get("attempts", 1)
 
         await bot.send_message(
             chat_id,
             f"🏁 <b>Quiz yakunlandi!</b> ({group_label})\n\n"
             f"✅ To'g'ri javoblar: <b>{correct_q} / {total_q}</b>\n"
-            f"📈 Natija: <b>{percent}%</b>\n\n"
+            f"📈 Natija: <b>{percent}%</b>\n"
+            f"🔁 Ushbu guruhdan ishlagan testlaringiz: <b>{g_attempts} marta</b>\n\n"
             "Yana boshqa guruhni tanlashingiz mumkin:",
             parse_mode="HTML",
             reply_markup=build_groups_keyboard(len(ALL_QUESTIONS)),
@@ -285,12 +443,38 @@ async def cmd_start(message: types.Message) -> None:
     await message.answer(
         "👋 Assalomu alaykum!\n"
         "<b>Hayot faoliyati xavfsizligi</b> fani bo'yicha Quiz botiga xush kelibsiz.\n"
-        "👨‍💻 Bot yaratuvchisi: <b>@TheTilavov</b>\n\n"
+        "👨‍💻 Bot yaratuvchisi: <b>TheTilavov</b>\n\n"
         f"📊 Bazada jami <b>{total} ta</b> savol mavjud.\n"
         "Savollar va javob variantlari har safar tasodifiy tartibda Telegram Quiz shaklida beriladi.\n"
         "Guruhni tanlang:",
         parse_mode="HTML",
         reply_markup=build_groups_keyboard(total),
+    )
+
+
+@dp.message(Command("rating"))
+async def cmd_rating(message: types.Message) -> None:
+    users = load_users()
+    uid = message.from_user.id if message.from_user else None
+    text = build_rating_text(users, current_user_id=uid)
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=build_groups_keyboard(len(ALL_QUESTIONS)),
+    )
+
+
+@dp.message(Command("my_stats"))
+async def cmd_my_stats(message: types.Message) -> None:
+    if not message.from_user:
+        return
+    users = load_users()
+    u_data = users.get(str(message.from_user.id), {})
+    groups_text = format_groups_summary(u_data.get("groups", {}))
+    await message.answer(
+        "📊 <b>Sizning test natijalaringiz:</b>\n\n" + groups_text,
+        parse_mode="HTML",
+        reply_markup=build_groups_keyboard(len(ALL_QUESTIONS)),
     )
 
 
@@ -307,7 +491,18 @@ async def cmd_stats(message: types.Message) -> None:
     lines = [f"📊 <b>Foydalanuvchilar soni:</b> {len(users)} ta\n"]
     for idx, u in enumerate(users.values(), start=1):
         uname = f"@{u['username']}" if u.get("username") else "username yo'q"
-        lines.append(f"{idx}. {u['full_name']} ({uname}) — <code>{u['id']}</code>")
+        lines.append(f"{idx}. <b>{u['full_name']}</b> ({uname}) — <code>{u['id']}</code>")
+        groups = u.get("groups", {})
+        if groups:
+            for g_label, g_stats in groups.items():
+                attempts = g_stats.get("attempts", 0)
+                correct = g_stats.get("correct", 0)
+                answered = g_stats.get("answered", 0)
+                lines.append(
+                    f"   └ {g_label}: <b>{attempts} marta</b> ({correct}/{answered} to'g'ri)"
+                )
+        else:
+            lines.append("   └ Hali test ishlamagan")
 
     full_text = "\n".join(lines)
     for i in range(0, len(full_text), 4000):
@@ -324,12 +519,26 @@ async def handle_messages(message: types.Message) -> None:
     text = message.text.strip()
     total = len(ALL_QUESTIONS)
 
+    if text == "🏆 Reyting":
+        await cmd_rating(message)
+        return
+
+    if text == "📊 Mening natijalarim":
+        await cmd_my_stats(message)
+        return
+
     if text == "🛑 Testni to'xtatish":
         session = active_quizzes.pop(user_id, None)
         clear_user_polls(user_id)
         if session:
+            answered = session["index"]
+            correct = session["correct"]
+            group_label = session["group_label"]
+            if answered > 0:
+                record_group_result(user_id, group_label, correct, answered)
             await message.answer(
-                f"🛑 Quiz to'xtatildi. To'g'ri javoblar: <b>{session['correct']} / {session['index']}</b>",
+                f"🛑 Quiz to'xtatildi ({group_label}).\n"
+                f"✅ To'g'ri javoblar: <b>{correct} / {answered}</b>",
                 parse_mode="HTML",
                 reply_markup=build_groups_keyboard(total),
             )
