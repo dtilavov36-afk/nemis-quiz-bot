@@ -285,7 +285,7 @@ async def cmd_start(message: types.Message) -> None:
     await message.answer(
         "👋 Assalomu alaykum!\n"
         "<b>Hayot faoliyati xavfsizligi</b> fani bo'yicha Quiz botiga xush kelibsiz.\n"
-        "👨‍💻 Bot yaratuvchisi: <b>TheTilavov</b>\n\n"
+        "👨‍💻 Bot yaratuvchisi: <b>@TheTilavov</b>\n\n"
         f"📊 Bazada jami <b>{total} ta</b> savol mavjud.\n"
         "Savollar va javob variantlari har safar tasodifiy tartibda Telegram Quiz shaklida beriladi.\n"
         "Guruhni tanlang:",
