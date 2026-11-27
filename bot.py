@@ -31,9 +31,10 @@ if not RAW_TOKEN or ":" not in RAW_TOKEN:
 bot = Bot(token=RAW_TOKEN)
 dp = Dispatcher()
 
-# Har bir foydalanuvchi uchun faol test holati:
-# user_id -> {"questions": [...], "index": 0, "correct": 0, "group_label": "..."}
+# user_id -> {"questions": [...], "index": 0, "correct": 0, "group_label": "...", "chat_id": int}
 active_quizzes: dict[int, dict] = {}
+# poll_id -> user_id
+poll_to_user: dict[str, int] = {}
 
 
 # ================= BAZA VA FOYDALANUVCHILAR =================
@@ -64,7 +65,8 @@ def load_questions() -> list[dict]:
         if not q_text or not isinstance(options, list) or len(options) < 2:
             continue
 
-        clean_options = [str(opt).strip() for opt in options if str(opt).strip()]
+        # Telegram Poll variant matni maksimal 100 belgi bo'lishi mumkin
+        clean_options = [str(opt).strip()[:100] for opt in options if str(opt).strip()]
         if len(clean_options) < 2:
             continue
 
@@ -73,7 +75,7 @@ def load_questions() -> list[dict]:
             if 0 <= correct < len(clean_options):
                 correct_idx = correct
         elif isinstance(correct, str):
-            c_clean = correct.strip()
+            c_clean = correct.strip()[:100]
             if c_clean in clean_options:
                 correct_idx = clean_options.index(c_clean)
             elif c_clean.isdigit() and 0 <= int(c_clean) < len(clean_options):
@@ -82,8 +84,8 @@ def load_questions() -> list[dict]:
         normalized.append(
             {
                 "question": q_text,
-                "options": clean_options,
-                "correct_index": correct_idx,
+                "options": clean_options[:10],
+                "correct_index": min(correct_idx, len(clean_options[:10]) - 1),
             }
         )
 
@@ -164,15 +166,20 @@ def build_groups_keyboard(total: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def build_options_keyboard(shuffled_options: list[str]) -> ReplyKeyboardMarkup:
-    rows: list[list[KeyboardButton]] = []
-    for opt in shuffled_options:
-        rows.append([KeyboardButton(text=opt)])
-    rows.append([KeyboardButton(text="🛑 Testni to'xtatish")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+def build_stop_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🛑 Testni to'xtatish")]],
+        resize_keyboard=True,
+    )
 
 
-# ================= TEST MANTIG'I =================
+def clear_user_polls(user_id: int) -> None:
+    stale_ids = [pid for pid, uid in poll_to_user.items() if uid == user_id]
+    for pid in stale_ids:
+        poll_to_user.pop(pid, None)
+
+
+# ================= QUIZ MANTIG'I =================
 def prepare_shuffled_slice(start_idx: int, end_idx: int) -> list[dict]:
     sliced = ALL_QUESTIONS[start_idx:end_idx]
     picked = random.sample(sliced, len(sliced))
@@ -192,10 +199,11 @@ def prepare_shuffled_slice(start_idx: int, end_idx: int) -> list[dict]:
     return prepared
 
 
-async def send_current_question(message: types.Message, user_id: int) -> None:
+async def send_current_quiz(chat_id: int, user_id: int) -> None:
     session = active_quizzes.get(user_id)
     if not session:
-        await message.answer(
+        await bot.send_message(
+            chat_id,
             "Guruhni tanlang:",
             reply_markup=build_groups_keyboard(len(ALL_QUESTIONS)),
         )
@@ -209,10 +217,12 @@ async def send_current_question(message: types.Message, user_id: int) -> None:
         correct_q = session["correct"]
         percent = round((correct_q / total_q) * 100, 1) if total_q else 0.0
         group_label = session["group_label"]
+        clear_user_polls(user_id)
         del active_quizzes[user_id]
 
-        await message.answer(
-            f"🏁 <b>Test yakunlandi!</b> ({group_label})\n\n"
+        await bot.send_message(
+            chat_id,
+            f"🏁 <b>Quiz yakunlandi!</b> ({group_label})\n\n"
             f"✅ To'g'ri javoblar: <b>{correct_q} / {total_q}</b>\n"
             f"📈 Natija: <b>{percent}%</b>\n\n"
             "Yana boshqa guruhni tanlashingiz mumkin:",
@@ -222,15 +232,45 @@ async def send_current_question(message: types.Message, user_id: int) -> None:
         return
 
     current_q = questions[idx]
-    text = (
-        f"<b>{session['group_label']}</b> | Savol <b>{idx + 1}/{len(questions)}</b>\n\n"
-        f"{current_q['question']}"
+    header = f"[{session['group_label']} | {idx + 1}/{len(questions)}] "
+    # Telegram Quiz savoli maksimal 300 belgi bo'lishi mumkin
+    max_q_len = 300 - len(header)
+    poll_question = f"{header}{current_q['question'][:max_q_len]}"
+
+    poll_msg = await bot.send_poll(
+        chat_id=chat_id,
+        question=poll_question,
+        options=current_q["options"],
+        type="quiz",
+        correct_option_id=current_q["correct_index"],
+        is_anonymous=False,
+        reply_markup=build_stop_keyboard(),
     )
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=build_options_keyboard(current_q["options"]),
-    )
+    if poll_msg.poll:
+        poll_to_user[poll_msg.poll.id] = user_id
+
+
+@dp.poll_answer()
+async def handle_poll_answer(poll_answer: types.PollAnswer) -> None:
+    user_id = poll_to_user.pop(poll_answer.poll_id, None)
+    if user_id is None:
+        return
+
+    session = active_quizzes.get(user_id)
+    if not session:
+        return
+
+    idx = session["index"]
+    if idx >= len(session["questions"]):
+        return
+
+    current_q = session["questions"][idx]
+    selected_ids = poll_answer.option_ids
+    if selected_ids and selected_ids[0] == current_q["correct_index"]:
+        session["correct"] += 1
+
+    session["index"] += 1
+    await send_current_quiz(session["chat_id"], user_id)
 
 
 # ================= BUYRUQLAR VA HANDLERLAR =================
@@ -238,15 +278,17 @@ async def send_current_question(message: types.Message, user_id: int) -> None:
 async def cmd_start(message: types.Message) -> None:
     await track_and_notify(message)
     if message.from_user:
+        clear_user_polls(message.from_user.id)
         active_quizzes.pop(message.from_user.id, None)
 
     total = len(ALL_QUESTIONS)
     await message.answer(
         "👋 Assalomu alaykum!\n"
-        "<b>Hayot faoliyati xavfsizligi</b> fani bo'yicha test botiga xush kelibsiz.\n\n"
+        "<b>Hayot faoliyati xavfsizligi</b> fani bo'yicha Quiz botiga xush kelibsiz.\n"
+        "👨‍💻 Bot yaratuvchisi: <b>TheTilavov</b>\n\n"
         f"📊 Bazada jami <b>{total} ta</b> savol mavjud.\n"
-        "Savollar va javob variantlari har safar tasodifiy tartibda aralashtiriladi.\n"
-        "Kerakli guruhni tanlang:",
+        "Savollar va javob variantlari har safar tasodifiy tartibda Telegram Quiz shaklida beriladi.\n"
+        "Guruhni tanlang:",
         parse_mode="HTML",
         reply_markup=build_groups_keyboard(total),
     )
@@ -278,14 +320,16 @@ async def handle_messages(message: types.Message) -> None:
         return
 
     user_id = message.from_user.id
+    chat_id = message.chat.id
     text = message.text.strip()
     total = len(ALL_QUESTIONS)
 
     if text == "🛑 Testni to'xtatish":
         session = active_quizzes.pop(user_id, None)
+        clear_user_polls(user_id)
         if session:
             await message.answer(
-                f"🛑 Test to'xtatildi. To'g'ri javoblar: <b>{session['correct']} / {session['index']}</b>",
+                f"🛑 Quiz to'xtatildi. To'g'ri javoblar: <b>{session['correct']} / {session['index']}</b>",
                 parse_mode="HTML",
                 reply_markup=build_groups_keyboard(total),
             )
@@ -297,13 +341,15 @@ async def handle_messages(message: types.Message) -> None:
         return
 
     if text.startswith("📚 Barcha savollar"):
+        clear_user_polls(user_id)
         active_quizzes[user_id] = {
             "questions": prepare_shuffled_slice(0, total),
             "index": 0,
             "correct": 0,
             "group_label": f"1–{total}",
+            "chat_id": chat_id,
         }
-        await send_current_question(message, user_id)
+        await send_current_quiz(chat_id, user_id)
         return
 
     if text.startswith("📘 "):
@@ -314,43 +360,19 @@ async def handle_messages(message: types.Message) -> None:
                 start_num = int(parts[0])
                 end_num = int(parts[1])
                 if 1 <= start_num <= end_num <= total:
+                    clear_user_polls(user_id)
                     active_quizzes[user_id] = {
                         "questions": prepare_shuffled_slice(start_num - 1, end_num),
                         "index": 0,
                         "correct": 0,
                         "group_label": f"{start_num}–{end_num}",
+                        "chat_id": chat_id,
                     }
-                    await send_current_question(message, user_id)
+                    await send_current_quiz(chat_id, user_id)
                     return
 
-    session = active_quizzes.get(user_id)
-    if session:
-        idx = session["index"]
-        current_q = session["questions"][idx]
-        correct_answer = current_q["options"][current_q["correct_index"]]
-
-        if text not in current_q["options"]:
-            await message.answer(
-                "Iltimos, quyidagi variantlardan birini tanlang:",
-                reply_markup=build_options_keyboard(current_q["options"]),
-            )
-            return
-
-        if text == correct_answer:
-            session["correct"] += 1
-            await message.answer("✅ To'g'ri!")
-        else:
-            await message.answer(
-                f"❌ Noto'g'ri.\nTo'g'ri javob: <b>{correct_answer}</b>",
-                parse_mode="HTML",
-            )
-
-        session["index"] += 1
-        await send_current_question(message, user_id)
-        return
-
     await message.answer(
-        "Testni boshlash uchun quyidagi guruhlardan birini tanlang:",
+        "Quizni boshlash uchun quyidagi guruhlardan birini tanlang:",
         reply_markup=build_groups_keyboard(total),
     )
 
@@ -371,6 +393,7 @@ async def start_web_server() -> web.AppRunner:
     await site.start()
     logging.info("🌐 Web server %d-portda ishga tushdi.", port)
     return runner
+
 
 async def main() -> None:
     runner = await start_web_server()
