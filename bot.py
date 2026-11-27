@@ -14,7 +14,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-RAW_TOKEN = os.getenv("BOT_TOKEN", "9260798734:AAFuHjxrirFFqxx8zje_QX4K-fHgPrmYZN0").strip()
+RAW_TOKEN = os.getenv("BOT_TOKEN", "9260798734:AAH6ZRChgfmp7gphSKV1i-gp9WwDE3aJXsM").strip()
 
 if not RAW_TOKEN or "BU_YERGA" in RAW_TOKEN or ":" not in RAW_TOKEN:
     raise ValueError(
